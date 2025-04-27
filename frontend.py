@@ -110,21 +110,32 @@ def search_db(db_path, search_tags_str, location_keyword):
         # Query directly for better control in the UI wrapper.
         query = "SELECT original_path, ollama_tags, status, processed_timestamp FROM processed_images WHERE 1=1"
         params = []
+        conditions = []  # Store individual AND conditions
 
+        # --- Tag Search Logic (remains the same) ---
         if tags_list:
             tag_clauses = []
             for tag in tags_list:
-                # Using LIKE for compatibility, assuming tags are stored like ["tag1", "tag2"]
+                # Search for the tag as a distinct JSON element "tag"
                 tag_clauses.append("ollama_tags LIKE ?")
-                params.append(f'%"{tag}"%')
+                params.append(f"%{tag}%")
             if tag_clauses:
-                # Find images with ANY of the tags
-                query += " AND (" + " OR ".join(tag_clauses) + ")"
+                # Find images with ANY of the tags (OR logic within this group)
+                conditions.append("(" + " OR ".join(tag_clauses) + ")")
 
+        # --- Location Search Logic (Corrected) ---
         if loc_keyword:
-            query += " AND ollama_tags LIKE ?"
-            params.append(f'%"{loc_keyword}"%')
+            # Search for the location keyword as a substring anywhere in the tags field
+            conditions.append("ollama_tags LIKE ?")
+            params.append(
+                f"%{loc_keyword}%"
+            )  # <<< REMOVED the double quotes around the keyword
 
+        # Combine all conditions with AND
+        if conditions:
+            query += " AND " + " AND ".join(conditions)
+
+        # --- Execute Query ---
         manager.cursor.execute(query, params)
         results = manager.cursor.fetchall()  # List of tuples
 
@@ -135,6 +146,7 @@ def search_db(db_path, search_tags_str, location_keyword):
                 "No matching images found.",
             )
 
+        # --- Process Results (remains the same) ---
         image_paths = []
         data_for_df = []
         found_count = len(results)

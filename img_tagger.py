@@ -12,6 +12,13 @@ from PIL import Image, UnidentifiedImageError, ExifTags
 import piexif
 import piexif.helper
 
+# --- New Imports for GPS/Location ---
+import exifread  # For robust GPS tag reading
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+# --- End New Imports ---
+
+
 # --- Configuration ---
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "llava"
@@ -57,14 +64,22 @@ def _get_exif_with_names(exif_dict):
         exif_with_names[ifd_name] = {}
         for tag, value in ifd_dict.items():
             tag_name = ExifTags.TAGS.get(tag, tag)  # Get name if available
-            exif_with_names[ifd_name][tag_name] = value  # Keep original value for now
+            # Special handling for GPS IFD tags
+            if ifd_name == "GPS":
+                gps_tag_name = ExifTags.GPSTAGS.get(tag, tag)
+                exif_with_names[ifd_name][gps_tag_name] = value
+            else:
+                exif_with_names[ifd_name][tag_name] = (
+                    value  # Keep original value for now
+                )
+
     return exif_with_names
 
 
 class ImageMetadataManager:
     """
     Manages image metadata tagging, storage, and retrieval using Ollama and SQLite.
-    Includes CLI interaction logic.
+    Includes CLI interaction logic and GPS-based location tagging.
     """
 
     def __init__(self, root_folder: str | None = None, db_path: str | None = None):
@@ -109,7 +124,7 @@ class ImageMetadataManager:
         self.supported_extensions = (
             ".jpg",
             ".jpeg",
-            ".png",
+            ".png",  # Note: PNG typically doesn't store standard EXIF/GPS
             ".gif",
             ".bmp",
             ".tiff",
@@ -117,6 +132,10 @@ class ImageMetadataManager:
         )
         self.conn = None
         self.cursor = None
+        # --- Initialize Geocoder ---
+        # Use a descriptive user_agent as required by Nominatim's ToS
+        self.geolocator = Nominatim(user_agent="image_tagger_script_v1.0")
+        # --- End Geocoder Init ---
         self._initialize_database()
         if self.root_folder:
             print(f"Initialized Manager for root folder: {self.root_folder}")
@@ -135,10 +154,10 @@ class ImageMetadataManager:
                 CREATE TABLE IF NOT EXISTS processed_images (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     original_path TEXT NOT NULL UNIQUE,
-                    ollama_tags TEXT,       -- JSON list of tags from Ollama
-                    all_exif_data TEXT,     -- JSON blob of all extracted EXIF
+                    ollama_tags TEXT,       -- JSON list of tags from Ollama (may include location)
+                    all_exif_data TEXT,     -- JSON blob of all extracted EXIF/metadata
                     processed_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT,            -- e.g., 'Success', 'No Tags', 'Metadata Error', 'Ollama Error'
+                    status TEXT,            -- e.g., 'Success', 'No Tags', 'Metadata Error', 'Ollama Error', 'GPS Error'
                     error_message TEXT NULL
                 )
             """)
@@ -168,7 +187,7 @@ class ImageMetadataManager:
         self,
         original_path: str,
         ollama_tags: list[str] | None,
-        all_exif: dict | None,
+        all_metadata: dict | None,  # Renamed from all_exif for clarity
         status: str,
         error_msg: str | None = None,
     ):
@@ -178,8 +197,11 @@ class ImageMetadataManager:
             return
 
         tags_json = json.dumps(ollama_tags) if ollama_tags else None
-        # Sanitize EXIF data before converting to JSON
-        exif_json = json.dumps(_sanitize_for_json(all_exif)) if all_exif else None
+
+        # Sanitize metadata before converting to JSON
+        metadata_json = (
+            json.dumps(_sanitize_for_json(all_metadata)) if all_metadata else None
+        )
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
@@ -194,7 +216,7 @@ class ImageMetadataManager:
                     status=excluded.status,
                     error_message=excluded.error_message
             """,
-                (original_path, tags_json, exif_json, timestamp, status, error_msg),
+                (original_path, tags_json, metadata_json, timestamp, status, error_msg),
             )
             # No explicit commit needed due to isolation_level=None
         except sqlite3.Error as e:
@@ -207,7 +229,9 @@ class ImageMetadataManager:
         self, image_path: str
     ) -> tuple[list[str] | None, str | None]:
         """Gets tags for the image using the Ollama API."""
-        print(f"  Attempting to get tags for: {os.path.basename(image_path)}...")
+        print(
+            f"  Attempting to get tags from Ollama for: {os.path.basename(image_path)}..."
+        )
         try:
             with open(image_path, "rb") as image_file:
                 encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
@@ -218,7 +242,8 @@ class ImageMetadataManager:
                 "images": [encoded_string],
                 "stream": False,
             }
-            response = requests.post(OLLAMA_API_URL, json=payload, timeout=120)
+            # Increased timeout for potentially slower model processing
+            response = requests.post(OLLAMA_API_URL, json=payload, timeout=180)
             response.raise_for_status()
             response_data = response.json()
             raw_tags_text = response_data.get("response", "").strip()
@@ -231,7 +256,7 @@ class ImageMetadataManager:
             ]
             tags = list(dict.fromkeys(tags))  # Remove duplicates
 
-            print(f"  Tags received: {tags}")
+            print(f"  Ollama tags received: {tags}")
             return (
                 (tags, None)
                 if tags
@@ -249,19 +274,135 @@ class ImageMetadataManager:
         except Exception as e:
             return None, f"Ollama interaction error: {e}"
 
+    # --- New GPS Helper Methods ---
+    def _convert_to_degrees(self, value):
+        """Helper function to convert the GPS coordinates stored in the EXIF to degrees"""
+        # Check if the value is valid and has the expected structure
+        if not hasattr(value, "__len__") or len(value) < 3:
+            return None  # Invalid format
+
+        try:
+            d = (
+                float(value[0].num) / float(value[0].den)
+                if value[0].den != 0
+                else float(value[0].num)
+            )
+            m = (
+                float(value[1].num) / float(value[1].den)
+                if value[1].den != 0
+                else float(value[1].num)
+            )
+            s = (
+                float(value[2].num) / float(value[2].den)
+                if value[2].den != 0
+                else float(value[2].num)
+            )
+            return d + (m / 60.0) + (s / 3600.0)
+        except (ZeroDivisionError, AttributeError, IndexError, ValueError) as e:
+            print(f"    Error converting GPS rational to degrees: {e}")
+            return None  # Error during conversion
+
+    def _get_gps_coordinates(self, image_path: str) -> tuple[float, float] | None:
+        """Extracts GPS coordinates using exifread."""
+        print(f"  Checking for GPS data in: {os.path.basename(image_path)}")
+        try:
+            with open(image_path, "rb") as f:
+                tags = exifread.process_file(
+                    f, stop_tag="GPS GPSLongitude"
+                )  # Stop early for efficiency
+
+            if not tags:
+                print("    No EXIF tags found by exifread.")
+                return None
+
+            gps_latitude = tags.get("GPS GPSLatitude")
+            gps_latitude_ref = tags.get("GPS GPSLatitudeRef")
+            gps_longitude = tags.get("GPS GPSLongitude")
+            gps_longitude_ref = tags.get("GPS GPSLongitudeRef")
+
+            if (
+                gps_latitude
+                and gps_latitude_ref
+                and gps_longitude
+                and gps_longitude_ref
+            ):
+                lat = self._convert_to_degrees(gps_latitude.values)
+                lon = self._convert_to_degrees(gps_longitude.values)
+
+                if lat is None or lon is None:
+                    print("    Failed to convert GPS coordinates.")
+                    return None  # Conversion error
+
+                # Check orientation (North/South, East/West)
+                if gps_latitude_ref.values[0] == "S":
+                    lat = -lat
+                if gps_longitude_ref.values[0] == "W":
+                    lon = -lon
+
+                print(f"    Found GPS Coordinates: Lat {lat:.5f}, Lon {lon:.5f}")
+                return lat, lon
+            else:
+                print("    Required GPS tags not found.")
+                return None
+        except FileNotFoundError:
+            print(f"    Error: File not found during GPS read: {image_path}")
+            return None
+        except Exception as e:
+            print(f"    Error reading GPS data with exifread: {e}")
+            return None
+
+    def _get_location_from_coordinates(
+        self, latitude: float, longitude: float
+    ) -> str | None:
+        """Gets a location name (full address) from GPS coordinates using geopy."""
+        print(
+            f"  Attempting reverse geocoding for Lat {latitude:.5f}, Lon {longitude:.5f}..."
+        )
+        try:
+            # timeout parameter is important for network issues
+            # language='en' helps ensure consistent results
+            location = self.geolocator.reverse(
+                (latitude, longitude), exactly_one=True, language="en", timeout=10
+            )
+            if location and location.address:
+                # --- Correction: Return the full address ---
+                full_address = location.address.strip()
+                print(f"    Reverse geocoding successful: {full_address}")
+                # Return the full address string as the tag
+                # Convert to lowercase for consistency with other tags
+                return full_address.lower()
+                # --- End Correction ---
+            else:
+                print("    Reverse geocoding returned no result.")
+                return None
+        except GeocoderTimedOut:
+            print("    Error: Reverse geocoding service timed out.")
+            return None
+        except GeocoderServiceError as e:
+            print(f"    Error: Reverse geocoding service error: {e}")
+            return None
+        except Exception as e:
+            print(f"    Unexpected error during reverse geocoding: {e}")
+            return None
+
+    # --- End GPS Helper Methods ---
+
     def _extract_and_add_metadata(
         self, image_path: str, tags: list[str]
     ) -> tuple[dict | None, bool, str | None]:
         """
-        Extracts existing metadata, adds Ollama tags (to UserComment for EXIF,
-        or a text chunk for PNG), and returns all extracted metadata.
+        Extracts existing metadata, adds combined (Ollama + Location) tags
+        (to UserComment for EXIF, or a text chunk for PNG), and returns all extracted metadata.
 
         Returns:
             A tuple: (all_extracted_metadata_dict or None, success_writing_tags boolean, error_message string or None)
         """
         print(f"  Processing metadata for: {os.path.basename(image_path)}")
-        tags_str = ", ".join(tags)
-        extracted_metadata = None  # Changed variable name for clarity
+        # Join the final list of tags (Ollama + potentially location)
+        tags_str = ", ".join(sorted(list(set(tags))))  # Sort and ensure unique
+        print(f"  Final tags to write: {tags_str}")
+
+        extracted_metadata = None
         write_success = False
         error_msg = None
 
@@ -272,12 +413,11 @@ class ImageMetadataManager:
                 # --- JPEG/TIFF Handling (Existing Logic) ---
                 if img_format in ["JPEG", "TIFF"]:
                     try:
-                        exif_dict = piexif.load(
-                            img.info.get("exif", b"")
-                        )  # Load from info if available
+                        # Load existing EXIF using piexif
+                        exif_dict = piexif.load(img.info.get("exif", b""))
                         # Get human-readable names for storage/viewing
                         extracted_metadata = _get_exif_with_names(exif_dict)
-                    except (piexif.InvalidImageDataError, ValueError, KeyError) as e:
+                    except Exception as e:  # Catch broader errors during load
                         print(
                             f"  Warning: Problem loading existing EXIF for {os.path.basename(image_path)} ({e}). Creating new structure."
                         )
@@ -288,19 +428,47 @@ class ImageMetadataManager:
                             "1st": {},
                             "thumbnail": None,
                         }
-                        extracted_metadata = {}
+                        # Try to get basic info if EXIF fails
+                        extracted_metadata = (
+                            {"Info": img.info.copy()} if img.info else {}
+                        )
 
                     try:
+                        # Ensure Exif IFD exists
                         if "Exif" not in exif_dict:
                             exif_dict["Exif"] = {}
+                        # Add tags to UserComment
                         exif_dict["Exif"][piexif.ExifIFD.UserComment] = (
                             piexif.helper.UserComment.dump(tags_str, encoding="unicode")
                         )
                         exif_bytes = piexif.dump(exif_dict)
                         # Save back using Pillow's save method with exif bytes
-                        img.save(image_path, exif=exif_bytes)  # Use Pillow's save
+                        # Preserve quality settings if possible
+                        save_kwargs = {"exif": exif_bytes}
+                        if img_format == "JPEG":
+                            save_kwargs["quality"] = img.info.get(
+                                "quality", 95
+                            )  # Default to 95 if not found
+                            save_kwargs["subsampling"] = img.info.get(
+                                "subsampling", -1
+                            )  # Preserve subsampling
+                            save_kwargs["progressive"] = img.info.get(
+                                "progressive", False
+                            )
+                            save_kwargs["icc_profile"] = img.info.get(
+                                "icc_profile"
+                            )  # Preserve color profile
+
+                        img.save(image_path, **save_kwargs)
                         print("  Successfully added tags to EXIF UserComment.")
                         write_success = True
+                        # Update extracted_metadata with the UserComment we just added for logging consistency
+                        if "Exif" not in extracted_metadata:
+                            extracted_metadata["Exif"] = {}
+                        extracted_metadata["Exif"]["UserComment"] = (
+                            tags_str  # Store the readable string
+                        )
+
                     except Exception as write_e:
                         error_msg = f"Failed to write EXIF tags: {write_e}"
                         print(f"  Error: {error_msg}")
@@ -324,12 +492,14 @@ class ImageMetadataManager:
                         from PIL.PngImagePlugin import PngInfo
 
                         pnginfo = PngInfo()
-                        # Optionally copy existing textual chunks (be careful not to duplicate)
-                        # for k, v in existing_info.items():
-                        #     if isinstance(v, str):
-                        #         pnginfo.add_text(k, v) # Copies existing text
+                        # Copy existing textual chunks (optional, be careful about duplicates)
+                        for k, v in existing_info.items():
+                            if isinstance(v, str):  # Only copy string chunks
+                                # Avoid re-adding our own keyword key if it exists
+                                if k.lower() != "keywords":
+                                    pnginfo.add_text(k, v)
 
-                        # Add Ollama tags as a new iTXt chunk (UTF-8)
+                        # Add combined tags as a new iTXt chunk (UTF-8)
                         keyword_key = "Keywords"  # A common key for tags
                         pnginfo.add_itxt(
                             keyword_key, tags_str, lang="en", tkey=keyword_key
@@ -337,7 +507,6 @@ class ImageMetadataManager:
                         print(f"  Prepared new PNG info with key '{keyword_key}'.")
 
                         # 3. Save the image with the new metadata
-                        # NOTE: This re-saves the entire PNG file.
                         img.save(image_path, pnginfo=pnginfo)
                         write_success = True
                         print(
@@ -398,52 +567,112 @@ class ImageMetadataManager:
         return extracted_metadata, write_success, error_msg
 
     def process_single_image(self, image_path: str, force_reprocess: bool = False):
-        """Processes a single image: gets tags, extracts/adds metadata, logs to DB."""
+        """Processes a single image: gets tags, extracts/adds metadata (incl. location), logs to DB."""
         basename = os.path.basename(image_path)
         abs_image_path = os.path.abspath(image_path)
-        print(f"Processing image: {basename}")
+        print(f"\nProcessing image: {basename} ({abs_image_path})")
 
         if not os.path.isfile(abs_image_path):
             print(f"Error: File not found: {abs_image_path}")
             # Log this specific error? Maybe not, as it didn't reach processing stages.
             return "File Not Found"
 
-        # For single file processing, 'force_reprocess' controls overwriting.
-        # The DB logging uses INSERT OR REPLACE, so it always updates/inserts.
+        # Check if skipped (only in batch mode, force=False)
         if not force_reprocess and self._is_already_processed(abs_image_path):
-            # This check might be redundant if we always want tag-single to reprocess.
-            # Keep it for now, controlled by the flag.
-            print("  Skipping: Already processed and force_reprocess=False.")
+            print(
+                "  Skipping: Already processed (found in DB) and force_reprocess=False."
+            )
             return "Skipped - DB Record Exists"
 
         # 1. Get tags from Ollama
         ollama_tags, ollama_error = self._get_tags_from_ollama(abs_image_path)
 
-        if ollama_error or not ollama_tags:
-            log_status = "Ollama Error" if ollama_error else "No Tags Received"
-            log_msg = ollama_error or "Ollama did not return any tags."
-            # Log failure, store no EXIF data as we didn't get tags to write
-            self._log_to_database(abs_image_path, None, None, log_status, log_msg)
-            return log_status
+        # Initialize final tags list
+        final_tags = []
+        if ollama_tags:
+            final_tags.extend(ollama_tags)
+        elif ollama_error:
+            # Log Ollama error but proceed to metadata extraction if possible
+            self._log_to_database(
+                abs_image_path, None, None, "Ollama Error", ollama_error
+            )
+            # We might still want to extract existing metadata even if Ollama fails
+            print(
+                f"  Warning: Ollama failed ({ollama_error}), proceeding to metadata extraction only."
+            )
+            # Attempt metadata extraction without adding new tags
+            extracted_metadata, _, metadata_error = self._extract_and_add_metadata(
+                abs_image_path, []
+            )  # Pass empty list
+            # Update log with extracted metadata if any, keep Ollama error status
+            self._log_to_database(
+                abs_image_path, None, extracted_metadata, "Ollama Error", ollama_error
+            )
+            return "Ollama Error"  # Return original error status
+        else:  # No tags and no specific error message from Ollama
+            self._log_to_database(
+                abs_image_path,
+                None,
+                None,
+                "No Tags Received",
+                "Ollama did not return any tags.",
+            )
+            # Proceed similar to Ollama error case
+            print(
+                "  Warning: Ollama returned no tags, proceeding to metadata extraction only."
+            )
+            extracted_metadata, _, metadata_error = self._extract_and_add_metadata(
+                abs_image_path, []
+            )
+            self._log_to_database(
+                abs_image_path,
+                None,
+                extracted_metadata,
+                "No Tags Received",
+                "Ollama did not return any tags.",
+            )
+            return "No Tags Received"
 
-        # 2. Extract existing metadata & Add Ollama tags to image metadata
-        all_exif, write_success, metadata_error = self._extract_and_add_metadata(
-            abs_image_path, ollama_tags
+        # --- GPS Location Tagging ---
+        location_tag = None
+        gps_coords = self._get_gps_coordinates(abs_image_path)
+        if gps_coords:
+            lat, lon = gps_coords
+            location_tag = self._get_location_from_coordinates(lat, lon)
+            if location_tag:
+                # Add location to the list if not already present from Ollama
+                if location_tag not in final_tags:
+                    final_tags.append(location_tag)
+                print(f"  Added location tag: '{location_tag}'")
+            else:
+                print("  Could not determine location tag from GPS coordinates.")
+                # Optionally log GPS presence even if geocoding failed?
+        else:
+            print("  No GPS coordinates found or readable.")
+        # --- End GPS Location Tagging ---
+
+        # 2. Extract existing metadata & Add combined tags to image metadata
+        # Use the 'final_tags' list which includes Ollama tags + potentially location tag
+        all_metadata, write_success, metadata_error = self._extract_and_add_metadata(
+            abs_image_path, final_tags
         )
 
         # 3. Log result to database (always log, even if metadata write failed)
         if write_success:
             log_status = "Success"
             self._log_to_database(
-                abs_image_path, ollama_tags, all_exif, log_status, None
+                abs_image_path, final_tags, all_metadata, log_status, None
             )
+            print(f"  Successfully processed and tagged: {basename}")
             return log_status
         else:
-            # Log failure status, include extracted EXIF if available
+            # Log failure status, include extracted metadata if available
             log_status = "Metadata Error"
+            # Log the final tags list even if writing failed, for debugging
             self._log_to_database(
-                abs_image_path, ollama_tags, all_exif, log_status, metadata_error
+                abs_image_path, final_tags, all_metadata, log_status, metadata_error
             )
+            print(f"  Finished processing {basename} with metadata error.")
             return log_status
 
     def tag_images_in_folders(self):
@@ -465,34 +694,63 @@ class ImageMetadataManager:
             "no_tags": 0,
             "metadata_error": 0,
             "other_error": 0,
-            "file_not_found": 0,
+            "file_not_found": 0,  # Should be rare here
+            "unsupported_format": 0,  # Track formats we don't write metadata for
         }
+        start_time = time.time()
+
+        # Get the absolute path and base name of the database file once
+        db_abs_path = os.path.abspath(self.db_path)
+        db_dir = os.path.dirname(db_abs_path)
+        db_filename = os.path.basename(db_abs_path)
 
         for dirpath, _, filenames in os.walk(self.root_folder):
-            # Skip the directory where the database itself is located
-            if os.path.abspath(dirpath) == os.path.dirname(self.db_path):
-                print(f"\nSkipping database directory: {dirpath}")
+            current_dir_abs = os.path.abspath(dirpath)
+
+            # Skip hidden directories (like .git, .vscode etc)
+            # Check the directory name itself, not the full path
+            if os.path.basename(current_dir_abs).startswith("."):
+                print(f"\nSkipping hidden directory: {dirpath}")
                 continue
 
             print(f"\nProcessing directory: {dirpath}")
-            image_files_in_dir = [
-                f for f in filenames if f.lower().endswith(self.supported_extensions)
-            ]
+
+            # Filter for supported image files initially
+            image_files_in_dir = sorted(
+                [f for f in filenames if f.lower().endswith(self.supported_extensions)]
+            )
+
+            # --- Correction: Filter out the DB file specifically ---
+            # Check if the current directory is the one containing the database
+            if current_dir_abs == db_dir:
+                if db_filename in image_files_in_dir:
+                    # This should not happen if DB has .db extension, but check anyway
+                    print(f"  Ignoring database file found in list: {db_filename}")
+                    image_files_in_dir.remove(db_filename)
+                # Also remove the db file if it wasn't caught by extension filter
+                elif db_filename in filenames:
+                    print(f"  Ignoring database file: {db_filename}")
+                    # No need to remove from image_files_in_dir as it wasn't added
+                # --- End Correction ---
 
             if not image_files_in_dir:
-                print("  No supported image files found.")
+                print("  No supported image files found (or only DB file was present).")
                 continue
 
-            for filename in image_files_in_dir:
+            num_files = len(image_files_in_dir)
+            for i, filename in enumerate(image_files_in_dir):
                 stats["found"] += 1
-                image_path = os.path.join(dirpath, filename)
+                image_path = os.path.join(
+                    dirpath, filename
+                )  # Use original dirpath here
+                print(f"--- File {i + 1}/{num_files} ---")
                 try:
                     # Use force_reprocess=False for batch mode (skip already processed)
                     result_status = self.process_single_image(
                         image_path, force_reprocess=False
                     )
 
-                    # Update counters
+                    # Update counters based on the returned status string
                     if result_status == "Success":
                         stats["success"] += 1
                     elif result_status == "Skipped - DB Record Exists":
@@ -504,25 +762,48 @@ class ImageMetadataManager:
                     elif result_status == "Metadata Error":
                         stats["metadata_error"] += 1
                     elif result_status == "File Not Found":
-                        stats["file_not_found"] += 1  # Should be rare here
+                        stats["file_not_found"] += 1
                     else:
                         stats["other_error"] += 1
                         print(
                             f"Warning: Unknown status '{result_status}' for {filename}"
                         )
 
+                except KeyboardInterrupt:
+                    print("\n\nBatch processing interrupted by user. Exiting.")
+                    self.close_db()
+                    exit()
                 except Exception as e:
                     stats["other_error"] += 1
                     print(f"!! Critical error processing {filename} in main loop: {e}")
-                    self._log_to_database(
-                        image_path, None, None, "Critical Error", str(e)
-                    )
+                    try:
+                        abs_path = os.path.abspath(image_path)
+                        self._log_to_database(
+                            abs_path, None, None, "Critical Error", str(e)
+                        )
+                    except Exception as log_e:
+                        print(f"!! Failed to log critical error to DB: {log_e}")
                     time.sleep(1)
 
+        end_time = time.time()
+        duration = end_time - start_time
         print("\n----------------------------------------")
         print("Batch tagging process finished.")
-        # Print stats... (omitted for brevity, same as before)
+        print(f"Total time: {duration:.2f} seconds")
+        print("--- Statistics ---")
+        print(f"Total images found:        {stats['found']}")
+        print(f"Successfully processed:    {stats['success']}")
+        print(f"Skipped (already in DB): {stats['skipped_db']}")
+        print(f"Ollama errors:           {stats['ollama_error']}")
+        print(f"Ollama - no tags:        {stats['no_tags']}")
+        print(f"Metadata write errors:   {stats['metadata_error']}")
+        print(f"File not found errors:   {stats['file_not_found']}")
+        print(f"Other critical errors:   {stats['other_error']}")
+        print("----------------------------------------")
         print(f"Results logged to: {self.db_path}")
+
+    # In c:\Users\frank\Documents\py_projects\dev\image_tag\img_tagger.py
+    # Inside the ImageMetadataManager class
 
     def search_images(
         self, tags: list[str] | None = None, location_keyword: str | None = None
@@ -536,39 +817,40 @@ class ImageMetadataManager:
             "SELECT original_path, ollama_tags, status FROM processed_images WHERE 1=1"
         )
         params = []
+        conditions = []  # Store individual AND conditions
+        search_terms = []  # Keep track of search terms for display
 
-        # --- Tag Search ---
-        # Simple search: finds images where *any* of the provided tags are present.
-        # Uses JSON_EXTRACT (requires recent SQLite) or LIKE for broader compatibility.
-        # For more complex logic (e.g., all tags must match), adjust the query.
+        # --- Tag Search Logic (remains the same) ---
         if tags:
             tag_clauses = []
+            search_terms.extend([f"tag: {t}" for t in tags])
             for tag in tags:
-                # Option 1: Using json_each (potentially more efficient if indexed)
-                # query += f" AND id IN (SELECT id FROM processed_images, json_each(ollama_tags) WHERE json_each.value = ?)"
-                # params.append(tag.lower())
-
-                # Option 2: Using LIKE (more compatible, might be slower)
+                # Search for the tag as a distinct JSON element "tag"
                 tag_clauses.append("ollama_tags LIKE ?")
-                params.append(
-                    f'%"{tag.lower()}"%'
-                )  # Search for the tag within the JSON array string
-
+                params.append(f"%{tag.lower().strip()}%")
             if tag_clauses:
-                query += (
-                    " AND (" + " OR ".join(tag_clauses) + ")"
-                )  # Find images with ANY of the tags
+                # Find images with ANY of the tags (OR logic within this group)
+                conditions.append("(" + " OR ".join(tag_clauses) + ")")
 
-        # --- Location Search (Basic Keyword in Tags) ---
-        # TODO: Enhance this to parse GPS data from all_exif_data if needed
+        # --- Location Search Logic (Corrected for CLI) ---
         if location_keyword:
-            print(
-                f"Searching for location keyword '{location_keyword}' in Ollama tags..."
-            )
-            query += " AND ollama_tags LIKE ?"
-            params.append(
-                f'%"{location_keyword.lower()}"%'
-            )  # Search within the JSON array string
+            loc_lower = location_keyword.lower().strip()
+            search_terms.append(f"location: {loc_lower}")
+            print(f"Searching for location keyword '{loc_lower}' in stored tags...")
+            # Search for the location keyword as a substring anywhere in the tags field
+            conditions.append("ollama_tags LIKE ?")
+            params.append(f"%{loc_lower}%")
+
+        # --- Combine conditions and execute ---
+        if not search_terms:
+            # Check moved here to allow combining tag and location search terms display
+            print("Error: No search criteria provided (use --tags or --location).")
+            return
+
+        if conditions:
+            query += " AND " + " AND ".join(conditions)
+
+        print(f"\nSearching for images with criteria: {', '.join(search_terms)}")
 
         try:
             self.cursor.execute(query, params)
@@ -582,7 +864,11 @@ class ImageMetadataManager:
             print("-" * 40)
             for row in results:
                 path, tags_json, status = row
-                tags_list = json.loads(tags_json) if tags_json else []
+                try:
+                    tags_list = json.loads(tags_json) if tags_json else []
+                except json.JSONDecodeError:
+                    tags_list = ["Error decoding tags"]
+
                 print(f"Path: {path}")
                 print(f"  Tags: {', '.join(tags_list)}")
                 print(f"  Status: {status}")
@@ -590,16 +876,18 @@ class ImageMetadataManager:
 
         except sqlite3.Error as e:
             print(f"Error searching database: {e}")
+            # Hint about old SQLite remains useful
             if "no such function: json_extract" in str(
                 e
             ) or "no such function: json_each" in str(e):
                 print(
-                    "Hint: Your SQLite version might be too old for JSON functions. Consider using the LIKE search method."
+                    "Hint: Your SQLite version might be too old for JSON functions. The current LIKE search should work, but this message indicates potential limitations."
                 )
 
     def view_record(self, image_path: str):
         """Displays the full database record for a specific image."""
         if not self.cursor:
+            print("Error: Database connection not available.")
             return
         abs_path = os.path.abspath(image_path)
         try:
@@ -610,24 +898,25 @@ class ImageMetadataManager:
             if record:
                 print("\nDatabase Record:")
                 print("-" * 30)
-                # Assuming column order: id, path, ollama_tags, all_exif, timestamp, status, error
                 col_names = [desc[0] for desc in self.cursor.description]
                 record_dict = dict(zip(col_names, record))
 
                 for key, value in record_dict.items():
+                    col_title = key.replace("_", " ").title()
                     if key in ["ollama_tags", "all_exif_data"] and value:
                         try:
                             # Pretty print JSON fields
                             parsed_json = json.loads(value)
-                            print(f"{key.replace('_', ' ').title()}:")
-                            print(json.dumps(parsed_json, indent=2))
+                            print(f"{col_title}:")
+                            # Use ensure_ascii=False for potentially non-ASCII chars in metadata
+                            print(json.dumps(parsed_json, indent=2, ensure_ascii=False))
                         except json.JSONDecodeError:
-                            print(
-                                f"{key.replace('_', ' ').title()}: (Invalid JSON in DB)"
-                            )
-                            print(value)
+                            print(f"{col_title}: (Invalid JSON in DB)")
+                            print(value)  # Print raw value if JSON is broken
+                    elif value is None:
+                        print(f"{col_title}: None")
                     else:
-                        print(f"{key.replace('_', ' ').title()}: {value}")
+                        print(f"{col_title}: {value}")
                 print("-" * 30)
             else:
                 print(f"No record found for path: {abs_path}")
@@ -636,7 +925,8 @@ class ImageMetadataManager:
 
     def delete_record(self, image_path: str):
         """Deletes the database record for a specific image."""
-        if not self.cursor:
+        if not self.cursor or not self.conn:
+            print("Error: Database connection not available.")
             return
         abs_path = os.path.abspath(image_path)
         try:
@@ -648,7 +938,15 @@ class ImageMetadataManager:
                 self.cursor.execute(
                     "DELETE FROM processed_images WHERE original_path = ?", (abs_path,)
                 )
-                print(f"Successfully deleted database record for: {abs_path}")
+                # Since isolation_level=None, changes are committed automatically.
+                # Verify deletion (optional)
+                self.cursor.execute("SELECT changes()")
+                changes = self.cursor.fetchone()[0]
+                if changes > 0:
+                    print(f"Successfully deleted database record for: {abs_path}")
+                else:
+                    print(f"Attempted delete, but no rows affected for: {abs_path}")
+
             else:
                 print(f"No record found to delete for path: {abs_path}")
         except sqlite3.Error as e:
@@ -657,10 +955,13 @@ class ImageMetadataManager:
     def update_record_tags(self, image_path: str, new_tags: list[str]):
         """Updates only the ollama_tags field in the database for a specific image."""
         # NOTE: This does NOT update the metadata in the image file itself.
-        if not self.cursor:
+        if not self.cursor or not self.conn:
+            print("Error: Database connection not available.")
             return
         abs_path = os.path.abspath(image_path)
-        tags_json = json.dumps(new_tags)
+        # Sanitize and prepare tags
+        clean_tags = sorted(list(set([t.lower().strip() for t in new_tags])))
+        tags_json = json.dumps(clean_tags)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             # Check if record exists first
@@ -676,8 +977,18 @@ class ImageMetadataManager:
                 """,
                     (tags_json, timestamp, abs_path),
                 )
-                print(f"Successfully updated database tags for: {abs_path}")
-                print("Note: Image file metadata was NOT modified.")
+                # Verify update (optional)
+                self.cursor.execute("SELECT changes()")
+                changes = self.cursor.fetchone()[0]
+                if changes > 0:
+                    print(f"Successfully updated database tags for: {abs_path}")
+                    print(f"  New tags: {', '.join(clean_tags)}")
+                    print("  Note: Image file metadata was NOT modified.")
+                else:
+                    print(
+                        f"Attempted update, but no rows affected for: {abs_path} (maybe tags were identical?)"
+                    )
+
             else:
                 print(f"No record found to update for path: {abs_path}")
         except sqlite3.Error as e:
@@ -686,17 +997,30 @@ class ImageMetadataManager:
     def close_db(self):
         """Closes the database connection."""
         if self.conn:
+            db_path = self.db_path  # Store path before closing
             try:
+                # Optional: Optimize DB before closing in WAL mode
+                print("Optimizing database...")
+                self.conn.execute("PRAGMA optimize;")
+                # Optional: Checkpoint WAL file before closing
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                 self.conn.close()
-                print("Database connection closed.")
+                self.conn = None  # Prevent further use
+                self.cursor = None
+                print(f"Database connection closed ({db_path}).")
             except sqlite3.Error as e:
-                print(f"Error closing database connection: {e}")
+                print(f"Error during database closing/optimization: {e}")
 
 
 # --- Main Execution & CLI Parsing ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Tag images using Ollama, store metadata in SQLite, and manage records."
+        description="Tag images using Ollama and GPS data, store metadata in SQLite, and manage records."
+    )
+    parser.add_argument(
+        "--db-path",
+        help="Optional: Specify a path for the database file. Overrides default locations.",
+        default=None,  # Explicitly default to None
     )
 
     subparsers = parser.add_subparsers(
@@ -710,7 +1034,7 @@ if __name__ == "__main__":
     parser_tag_all.add_argument(
         "root_folder", help="The root directory containing images to process."
     )
-    # parser_tag_all.add_argument("--db-path", help="Optional: Specify a custom path for the database file.") # Add if needed
+    # Note: --db-path is now a top-level argument
 
     # --- Tag Single Command ---
     parser_tag_single = subparsers.add_parser(
@@ -724,10 +1048,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Force reprocessing even if already in database.",
     )
-    parser_tag_single.add_argument(
-        "--db-path",
-        help="Optional: Specify the path to the database file to use/create.",
-    )
+    # Note: --db-path is now a top-level argument
 
     # --- Search Command ---
     parser_search = subparsers.add_parser(
@@ -738,11 +1059,9 @@ if __name__ == "__main__":
     )
     parser_search.add_argument(
         "--location",
-        help="Keyword to search for in Ollama tags (basic location search).",
+        help="Keyword to search for in stored tags (e.g., city name from GPS).",
     )
-    parser_search.add_argument(
-        "--db-path", required=True, help="Path to the database file to search."
-    )  # Require DB for search
+    # Note: --db-path is now a top-level argument, but marked required conceptually for this command
 
     # --- View Command ---
     parser_view = subparsers.add_parser(
@@ -751,9 +1070,7 @@ if __name__ == "__main__":
     parser_view.add_argument(
         "image_path", help="Path to the image file whose record you want to view."
     )
-    parser_view.add_argument(
-        "--db-path", required=True, help="Path to the database file."
-    )
+    # Note: --db-path is now a top-level argument, but marked required conceptually
 
     # --- Delete Command ---
     parser_delete = subparsers.add_parser(
@@ -762,9 +1079,7 @@ if __name__ == "__main__":
     parser_delete.add_argument(
         "image_path", help="Path to the image file whose record you want to delete."
     )
-    parser_delete.add_argument(
-        "--db-path", required=True, help="Path to the database file."
-    )
+    # Note: --db-path is now a top-level argument, but marked required conceptually
 
     # --- Update Command (DB Only) ---
     parser_update = subparsers.add_parser(
@@ -777,40 +1092,53 @@ if __name__ == "__main__":
     parser_update.add_argument(
         "--tags", nargs="+", required=True, help="The new list of tags."
     )
-    parser_update.add_argument(
-        "--db-path", required=True, help="Path to the database file."
-    )
+    # Note: --db-path is now a top-level argument, but marked required conceptually
 
     args = parser.parse_args()
 
     manager = None
+    db_path_to_use = args.db_path  # Use the top-level argument if provided
+
     try:
-        # Initialize Manager based on command
+        # Initialize Manager based on command and db_path
         if args.command == "tag-all":
-            # db_path = args.db_path if hasattr(args, 'db_path') else None # Get optional db path if added
+            # For tag-all, root_folder determines default DB path if --db-path is not given
             manager = ImageMetadataManager(
-                root_folder=args.root_folder
-            )  # DB path derived from root
+                root_folder=args.root_folder, db_path=db_path_to_use
+            )
             manager.tag_images_in_folders()
         elif args.command == "tag-single":
-            # For single, DB path can be specified or defaults to CWD
-            manager = ImageMetadataManager(db_path=args.db_path)
+            # For single, db_path defaults to CWD if --db-path is not given
+            manager = ImageMetadataManager(db_path=db_path_to_use)
             manager.process_single_image(args.image_path, force_reprocess=args.force)
-        elif args.command == "search":
-            manager = ImageMetadataManager(db_path=args.db_path)  # Only need DB path
-            if not args.tags and not args.location:
-                print("Error: Please provide --tags or --location for searching.")
-            else:
-                manager.search_images(tags=args.tags, location_keyword=args.location)
-        elif args.command == "view":
-            manager = ImageMetadataManager(db_path=args.db_path)
-            manager.view_record(args.image_path)
-        elif args.command == "delete":
-            manager = ImageMetadataManager(db_path=args.db_path)
-            manager.delete_record(args.image_path)
-        elif args.command == "update-tags":
-            manager = ImageMetadataManager(db_path=args.db_path)
-            manager.update_record_tags(args.image_path, args.tags)
+        else:
+            # For DB management commands (search, view, delete, update), db_path is needed.
+            # The __init__ handles defaulting to CWD if db_path_to_use is None,
+            # but these commands are less useful without a specific DB.
+            # We'll rely on the manager's initialization logic.
+            if not db_path_to_use:
+                # If no specific DB path is given for these commands, try CWD default.
+                # Consider making --db-path required for these subcommands if CWD default is undesirable.
+                print(
+                    "Warning: No --db-path specified. Using default database location (likely current working directory)."
+                )
+
+            manager = ImageMetadataManager(db_path=db_path_to_use)
+
+            if args.command == "search":
+                if not args.tags and not args.location:
+                    print("Error: Please provide --tags or --location for searching.")
+                    parser_search.print_help()
+                else:
+                    manager.search_images(
+                        tags=args.tags, location_keyword=args.location
+                    )
+            elif args.command == "view":
+                manager.view_record(args.image_path)
+            elif args.command == "delete":
+                manager.delete_record(args.image_path)
+            elif args.command == "update-tags":
+                manager.update_record_tags(args.image_path, args.tags)
 
         print("\nOperation finished.")
 
@@ -822,9 +1150,15 @@ if __name__ == "__main__":
         print(f"Error: File not found - {fnf}")
     except PermissionError as pe:
         print(f"Error: Permission denied - {pe}")
+    except ImportError as ie:
+        if "exifread" in str(ie) or "geopy" in str(ie):
+            print(f"Error: Missing required library. Please install it using:")
+            print(f"  pip install exifread geopy")
+        else:
+            print(f"An unexpected import error occurred: {ie}")
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
-        # Consider adding more specific exception handling or logging traceback for debugging
+        # Uncomment for detailed debugging
         # import traceback
         # traceback.print_exc()
     finally:
