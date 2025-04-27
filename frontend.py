@@ -533,7 +533,10 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             load_all_button = gr.Button("Load All Records")
             load_all_status_output = gr.Textbox(label="Load Status", interactive=False)
             all_records_table = gr.DataFrame(
-                label="All Database Records", interactive=False, wrap=True
+                label="All Database Records",
+                interactive=False,
+                wrap=True,
+                show_copy_button=True,
             )
 
             load_all_button.click(
